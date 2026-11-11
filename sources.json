@@ -1,0 +1,69 @@
+{
+  "max_size": [3840, 2160],
+  "jpeg_quality": 85,
+  "skip_last_week": true,
+  "min_total": 10,
+  "sources": [
+    {
+      "name": "Met European paintings",
+      "type": "met-department",
+      "departments": [11, 15],
+      "classification": "Paintings",
+      "count": 30,
+      "min_ratio": 1.15,
+      "max_ratio": 2.6
+    },
+    {
+      "name": "Cleveland European paintings",
+      "type": "cma",
+      "department": "European Painting and Sculpture",
+      "count": 15,
+      "min_ratio": 1.15,
+      "max_ratio": 2.6
+    },
+    {
+      "name": "Met Japanese screens",
+      "type": "met-search",
+      "departments": [6],
+      "queries": ["folding screen", "screen"],
+      "culture_terms": ["japan"],
+      "kind_terms": ["screen"],
+      "count": 15,
+      "min_ratio": 1.3,
+      "max_ratio": 3.6
+    },
+    {
+      "name": "Cleveland Japanese screens",
+      "type": "cma",
+      "department": "Japanese Art",
+      "text_terms": ["screen"],
+      "count": 10,
+      "min_ratio": 1.3,
+      "max_ratio": 3.6
+    },
+    {
+      "name": "Cleveland Indian paintings",
+      "type": "cma",
+      "department": "Indian and South East Asian Art",
+      "culture_terms": ["india", "nepal", "sri lanka", "bhutan",
+                        "mughal", "deccan", "rajasthan", "rajput", "pahari", "punjab",
+                        "kashmir", "bengal", "gujarat", "himachal", "mewar", "kangra"],
+      "count": 20,
+      "min_ratio": 0.55,
+      "max_ratio": 2.6
+    },
+    {
+      "name": "Met Indian paintings",
+      "type": "met-search",
+      "departments": [6, 14],
+      "queries": ["India", "Mughal", "Rajput", "Pahari", "Deccan", "Nepal"],
+      "culture_terms": ["india", "nepal", "sri lanka", "bhutan",
+                        "mughal", "deccan", "rajasthan", "rajput", "pahari", "punjab",
+                        "kashmir", "bengal", "gujarat", "himachal", "mewar", "kangra"],
+      "kind_terms": ["painting", "codices", "album", "folio"],
+      "count": 10,
+      "min_ratio": 0.55,
+      "max_ratio": 2.6
+    }
+  ]
+}
