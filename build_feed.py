@@ -28,11 +28,27 @@ CMA = "https://openaccess-api.clevelandart.org/api/artworks/"
 HEADERS = {"User-Agent": "aerialviews-art-feed/1.0 (+github actions)"}
 MAX_DOWNLOAD = 150 * 1024 * 1024
 MAX_TRIES_PER_PICK = 8          # downloads attempted per painting wanted
+MAX_MET_LOOKUPS = 4000          # Met object lookups per source, at most
 Image.MAX_IMAGE_PIXELS = 600_000_000  # museum scans are huge; these sources are trusted
+LOG_LINES = []                  # also published as build-log.txt
 
 
 def log(msg):
     print(msg, flush=True)
+    LOG_LINES.append(str(msg))
+
+
+def num(value):
+    """Museum APIs send sizes as numbers or as text ("3400"); accept both."""
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def ratio_of(width, height):
+    w, h = num(width), num(height)
+    return w / h if w and h else None
 
 
 def fetch(url, tries=3, limit=None):
@@ -70,22 +86,26 @@ def contains_any(text, terms):
 def met_ratio(o):
     for m in o.get("measurements") or []:
         em = m.get("elementMeasurements") or {}
-        if em.get("Height") and em.get("Width"):
-            return em["Width"] / em["Height"]
+        r = ratio_of(em.get("Width"), em.get("Height"))
+        if r:
+            return r
     found = re.search(r"\(([\d.]+)\s*[x×]\s*([\d.]+)\s*cm\)", o.get("dimensions") or "")
-    if found and float(found.group(1)) > 0:
-        return float(found.group(2)) / float(found.group(1))
-    return None
+    return ratio_of(found.group(2), found.group(1)) if found else None
 
 
 def met_candidates(src, ids):
     ids = list(dict.fromkeys(ids))
     random.shuffle(ids)
     log(f"  {len(ids)} Met objects to sample from")
-    for oid in ids:
+    failed_in_a_row = 0
+    for oid in ids[:MAX_MET_LOOKUPS]:
         try:
             o = get_json(f"{MET}/objects/{oid}")
-        except Exception:
+            failed_in_a_row = 0
+        except Exception as e:
+            failed_in_a_row += 1
+            if failed_in_a_row >= 15:
+                raise RuntimeError(f"the Met stopped answering object lookups ({e})")
             continue
         time.sleep(0.05)  # stay well under the Met's 80 requests/second
         if not (o.get("isPublicDomain") and o.get("primaryImage")):
@@ -118,8 +138,18 @@ def met_search(src):
     for d in src["departments"]:
         for q in src["queries"]:
             params = urllib.parse.urlencode({"departmentId": d, "hasImages": "true", "q": q})
-            ids += get_json(f"{MET}/search?{params}").get("objectIDs") or []
+            try:
+                found = get_json(f"{MET}/search?{params}").get("objectIDs") or []
+            except Exception as e:
+                log(f"  Met search for '{q}' in department {d} failed: {e}")
+                found = []
+            log(f"  Met search '{q}' in department {d}: {len(found)} matches")
+            ids += found
             time.sleep(0.2)
+    if not ids:  # search is down or found nothing: sample the whole departments instead
+        log("  falling back to scanning the full department lists")
+        for d in src["departments"]:
+            ids += get_json(f"{MET}/objects?departmentIds={d}").get("objectIDs") or []
     yield from met_candidates(src, ids)
 
 
@@ -150,10 +180,9 @@ def cma(src):
         creators = a.get("creators") or []
         artist = creators[0].get("description") if creators else None
         parts = (a.get("title"), artist, a.get("creation_date"))
-        w, h = img.get("width"), img.get("height")
         yield {"key": f"cma-{a.get('id')}", "url": img["url"],
                "description": " - ".join(clean(p) for p in parts if p),
-               "ratio": (w / h) if w and h else None}
+               "ratio": ratio_of(img.get("width"), img.get("height"))}
 
 
 GENERATORS = {"met-department": met_department, "met-search": met_search, "cma": cma}
@@ -184,7 +213,7 @@ def save_resized(data, max_size, quality, out_file, thumb_file, lo, hi):
 def build_source(src, cfg, out, exclude, base_url):
     want = int(src.get("count", 10))
     lo, hi = float(src.get("min_ratio", 1.15)), float(src.get("max_ratio", 3.0))
-    rows, tries = [], 0
+    rows, tries, note = [], 0, ""
     try:
         for c in GENERATORS[src["type"]](src):
             if c["key"] in exclude:
@@ -213,8 +242,12 @@ def build_source(src, cfg, out, exclude, base_url):
             if len(rows) >= want:
                 break
     except Exception as e:  # the API is down or changed: keep going with other sources
-        log(f"  {src['name']} stopped early: {e}")
-    return rows
+        note = f"stopped early: {type(e).__name__}: {e}"
+        log(f"  {src['name']} {note}")
+    if not note and len(rows) < want:
+        note = "ran out of suitable works"
+    log(f"  => {src['name']}: {len(rows)} of {want}{' (' + note + ')' if note else ''}")
+    return rows, note
 
 
 def last_week_keys(base_url):
@@ -225,7 +258,7 @@ def last_week_keys(base_url):
     return set(re.findall(r"/img/([\w-]+)\.jpg", text))
 
 
-def write_site(out, rows, base_url):
+def write_site(out, rows, base_url, summary):
     lines = ["url,description"] + [f'{r["url"]},"{r["description"]}"' for r in rows]
     (out / "feed.csv").write_text("\n".join(lines) + "\n", encoding="utf-8")
     m3u = ["#EXTM3U"] + [f'#EXTINF:-1,{r["description"]}\n{r["url"]}' for r in rows]
@@ -234,6 +267,10 @@ def write_site(out, rows, base_url):
         f'<a href="img/{r["key"]}.jpg"><img loading="lazy" src="thumbs/{r["key"]}.jpg" alt="">'
         f'<span>{html.escape(r["description"])}<br><small>{html.escape(r["source"])}</small></span></a>'
         for r in rows)
+    sources = "".join(
+        f"<li>{html.escape(name)}: {got} of {want}"
+        f"{' <small>(' + html.escape(note) + ')</small>' if note else ''}</li>"
+        for name, got, want, note in summary)
     (out / "index.html").write_text(f"""<!doctype html>
 <html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
@@ -244,9 +281,11 @@ h1{{font-size:20px;margin:0 0 4px}} p{{margin:0 0 16px;color:#aaa}} a{{color:inh
 .grid{{display:grid;grid-template-columns:repeat(auto-fill,minmax(220px,1fr));gap:14px}}
 .grid img{{width:100%;aspect-ratio:16/10;object-fit:cover;border-radius:6px;background:#222}}
 .grid span{{display:block;margin-top:6px;font-size:13px}} small{{color:#888}}
+ul{{margin:0 0 16px;padding-left:20px;color:#aaa}} p a,ul a{{text-decoration:underline}}
 </style></head><body>
 <h1>This week's paintings</h1>
-<p>{len(rows)} works, built {time.strftime('%Y-%m-%d')}. Aerial Views feed: <a href="feed.csv">{html.escape(base_url)}/feed.csv</a></p>
+<p>{len(rows)} works, built {time.strftime('%Y-%m-%d')}. Aerial Views feed: <a href="feed.csv">{html.escape(base_url)}/feed.csv</a> · <a href="build-log.txt">build log</a></p>
+<ul>{sources}</ul>
 <div class="grid">
 {cards}
 </div></body></html>
@@ -271,18 +310,24 @@ def main():
     exclude = last_week_keys(base_url) if cfg.get("skip_last_week", True) else set()
     log(f"Skipping {len(exclude)} paintings used last week")
 
-    rows = []
+    rows, summary = [], []
     for src in cfg["sources"]:
         log(f"{src['name']}: want {src.get('count', 10)}")
-        rows += build_source(src, cfg, out, exclude, base_url)
+        got, note = build_source(src, cfg, out, exclude, base_url)
+        rows += got
+        summary.append((src["name"], len(got), int(src.get("count", 10)), note))
 
+    log("Summary:")
+    for name, got, want, note in summary:
+        log(f"  {name}: {got} of {want}{' (' + note + ')' if note else ''}")
     if len(rows) < cfg.get("min_total", 10):
         log(f"Only {len(rows)} paintings found; not publishing, so last week's set stays up.")
         sys.exit(1)
     random.shuffle(rows)
-    write_site(out, rows, base_url)
+    write_site(out, rows, base_url, summary)
     size = sum(f.stat().st_size for f in (out / "img").iterdir()) / 1e6
     log(f"Done: {len(rows)} paintings, {size:.0f} MB of images")
+    (out / "build-log.txt").write_text("\n".join(LOG_LINES) + "\n", encoding="utf-8")
 
 
 if __name__ == "__main__":
