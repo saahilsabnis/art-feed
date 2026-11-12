@@ -13,6 +13,7 @@ import argparse
 import html
 import io
 import json
+import math
 import random
 import re
 import sys
@@ -26,7 +27,7 @@ from PIL import Image
 MET = "https://collectionapi.metmuseum.org/public/collection/v1"
 CMA = "https://openaccess-api.clevelandart.org/api/artworks/"
 HEADERS = {"User-Agent": "aerialviews-art-feed/1.0 (+github actions)"}
-MAX_DOWNLOAD = 150 * 1024 * 1024
+MAX_DOWNLOAD = 300 * 1024 * 1024   # Cleveland's full scans are uncompressed TIFFs (~70-130 MB)
 MAX_TRIES_PER_PICK = 8          # downloads attempted per painting wanted
 MAX_MET_LOOKUPS = 4000          # Met object lookups per source, at most
 Image.MAX_IMAGE_PIXELS = 600_000_000  # museum scans are huge; these sources are trusted
@@ -120,6 +121,12 @@ def met_candidates(src, ids):
                 "culture", "country", "region", "subregion", "state", "period", "dynasty"))
             if not contains_any(place, src["culture_terms"]):
                 continue
+        if src.get("exclude_terms"):
+            about = " ".join(str(o.get(f) or "") for f in (
+                "culture", "country", "region", "subregion", "state", "period", "dynasty",
+                "department", "classification", "objectName", "title"))
+            if contains_any(about, src["exclude_terms"]):
+                continue
         parts = (o.get("title"), o.get("artistDisplayName"), o.get("objectDate"))
         yield {"key": f"met-{oid}", "url": o["primaryImage"],
                "description": " - ".join(clean(p) for p in parts if p),
@@ -168,8 +175,10 @@ def cma(src):
         time.sleep(0.3)
     log(f"  {len(items)} Cleveland works to sample from")
     random.shuffle(items)
+    size = src.get("image", "full")  # "full" = original scan (TIFF), "print" = 3400px JPEG
     for a in items:
-        img = (a.get("images") or {}).get("print") or {}
+        imgs = a.get("images") or {}
+        img = imgs.get(size) or imgs.get("print") or {}
         if not img.get("url"):
             continue
         if src.get("culture_terms") and not contains_any(" ".join(a.get("culture") or []), src["culture_terms"]):
@@ -177,12 +186,17 @@ def cma(src):
         if src.get("text_terms") and not contains_any(
                 f"{a.get('title', '')} {a.get('technique', '')}", src["text_terms"]):
             continue
+        if src.get("exclude_terms") and contains_any(
+                f"{' '.join(a.get('culture') or [])} {a.get('title', '')} {a.get('technique', '')}",
+                src["exclude_terms"]):
+            continue
         creators = a.get("creators") or []
         artist = creators[0].get("description") if creators else None
         parts = (a.get("title"), artist, a.get("creation_date"))
         yield {"key": f"cma-{a.get('id')}", "url": img["url"],
                "description": " - ".join(clean(p) for p in parts if p),
-               "ratio": ratio_of(img.get("width"), img.get("height"))}
+               "ratio": ratio_of(img.get("width"), img.get("height")),
+               "pixels": (num(img.get("width")), num(img.get("height")))}
 
 
 GENERATORS = {"met-department": met_department, "met-search": met_search, "cma": cma}
@@ -190,50 +204,85 @@ GENERATORS = {"met-department": met_department, "met-search": met_search, "cma":
 
 # ---------------- images ----------------
 
-def save_resized(data, max_size, quality, out_file, thumb_file, lo, hi):
-    """Fit the image inside max_size, save as JPEG, and make a gallery thumbnail.
-    Returns False (and saves nothing) if the picture's shape is outside lo..hi."""
+def detail_scale(width, height, out_w, out_h, crop):
+    """How many source pixels per screen pixel the picture has (1.0 = exactly 4K)."""
+    if crop:  # the cropped area must cover the whole screen
+        return min(width / out_w, height / out_h)
+    return max(width / out_w, height / out_h)  # fitted inside the screen
+
+
+def save_resized(data, cfg, out_file, thumb_file, lo, hi):
+    """Crop (or fit) the picture to the screen, save it as a high-quality JPEG and
+    make a gallery thumbnail. Returns None if saved, or why it was skipped."""
+    out_w, out_h = cfg["max_size"]
+    crop = cfg.get("crop_to_fill", True)
     with Image.open(io.BytesIO(data)) as im:
-        if not (lo <= im.width / im.height <= hi):
-            return False
-        im.draft("RGB", tuple(max_size))  # fast downscale while decoding JPEGs
+        w, h = im.size
+        if not (lo <= w / h <= hi):
+            return "wrong shape"
+        s = detail_scale(w, h, out_w, out_h, crop)
+        if s < cfg.get("min_source_scale", 1.0):
+            return "too low-res"
+        # Decode big JPEGs at a reduced size, but never below what the screen needs.
+        im.draft("RGB", (math.ceil(w / s), math.ceil(h / s)))
         im = im.convert("RGB")
-        im.thumbnail(tuple(max_size), Image.LANCZOS)
-        for q in (quality, quality - 10):
+        if crop:  # centre-crop to exactly the screen's shape, then scale to 4K
+            target = out_w / out_h
+            if im.width / im.height > target:
+                cw, ch = round(im.height * target), im.height
+            else:
+                cw, ch = im.width, round(im.width / target)
+            left, top = (im.width - cw) // 2, (im.height - ch) // 2
+            im = im.crop((left, top, left + cw, top + ch)).resize((out_w, out_h), Image.LANCZOS)
+        else:
+            im.thumbnail((out_w, out_h), Image.LANCZOS)
+        quality = cfg.get("jpeg_quality", 92)
+        for q in (quality, quality - 6):
             buf = io.BytesIO()
-            im.save(buf, "JPEG", quality=q, optimize=True, progressive=True)
-            if buf.tell() <= 2_500_000:
+            # subsampling=0 keeps full colour detail (4:4:4) for fine brushwork
+            im.save(buf, "JPEG", quality=q, subsampling=0, optimize=True, progressive=True)
+            if buf.tell() <= cfg.get("max_file_mb", 6) * 1e6:
                 break
         out_file.write_bytes(buf.getvalue())
         im.thumbnail((480, 480), Image.LANCZOS)
         im.save(thumb_file, "JPEG", quality=80)
-    return True
+    return None
 
 
 def build_source(src, cfg, out, exclude, base_url):
     want = int(src.get("count", 10))
     lo, hi = float(src.get("min_ratio", 1.15)), float(src.get("max_ratio", 3.0))
+    out_w, out_h = cfg["max_size"]
+    crop, min_scale = cfg.get("crop_to_fill", True), cfg.get("min_source_scale", 1.0)
     rows, tries, note = [], 0, ""
+    rejected = {"wrong shape": 0, "too low-res": 0}
     try:
         for c in GENERATORS[src["type"]](src):
             if c["key"] in exclude:
                 continue
             # The catalogue shape is a rough guide (a pair of screens may be photographed
             # together), so only skip clear misses here and check real pixels below.
-            if c["ratio"] and not (lo * 0.75 <= c["ratio"] <= hi * 1.5):
+            if c["ratio"] and not (lo * 0.92 <= c["ratio"] <= hi * 1.5):
                 continue
+            pw, ph = c.get("pixels") or (None, None)
+            if pw and ph:  # pixel size known up front (Cleveland): skip without downloading
+                if not (lo <= pw / ph <= hi):
+                    continue
+                if detail_scale(pw, ph, out_w, out_h, crop) < min_scale:
+                    rejected["too low-res"] += 1
+                    continue
             tries += 1
             if tries > want * MAX_TRIES_PER_PICK:
                 break
             try:
                 data = fetch(c["url"], limit=MAX_DOWNLOAD)
-                fits = save_resized(data, cfg["max_size"], cfg["jpeg_quality"],
-                                    out / "img" / f"{c['key']}.jpg",
-                                    out / "thumbs" / f"{c['key']}.jpg", lo, hi)
+                why = save_resized(data, cfg, out / "img" / f"{c['key']}.jpg",
+                                   out / "thumbs" / f"{c['key']}.jpg", lo, hi)
             except Exception as e:
                 log(f"    skipped {c['key']}: {e}")
                 continue
-            if not fits:
+            if why:
+                rejected[why] += 1
                 continue
             exclude.add(c["key"])
             rows.append({"key": c["key"], "url": f"{base_url}/img/{c['key']}.jpg",
@@ -246,6 +295,8 @@ def build_source(src, cfg, out, exclude, base_url):
         log(f"  {src['name']} {note}")
     if not note and len(rows) < want:
         note = "ran out of suitable works"
+    log(f"  skipped after checking: {rejected['wrong shape']} wrong shape, "
+        f"{rejected['too low-res']} too low-res")
     log(f"  => {src['name']}: {len(rows)} of {want}{' (' + note + ')' if note else ''}")
     return rows, note
 
@@ -301,7 +352,7 @@ def main():
 
     cfg = json.loads(Path(a.config).read_text(encoding="utf-8"))
     cfg.setdefault("max_size", [3840, 2160])
-    cfg.setdefault("jpeg_quality", 85)
+    cfg.setdefault("jpeg_quality", 92)
     base_url = a.base_url.rstrip("/")
     out = Path(a.out)
     (out / "img").mkdir(parents=True, exist_ok=True)
@@ -312,6 +363,8 @@ def main():
 
     rows, summary = [], []
     for src in cfg["sources"]:
+        # Top-level exclude_terms apply to every source.
+        src = {**src, "exclude_terms": src.get("exclude_terms", []) + cfg.get("exclude_terms", [])}
         log(f"{src['name']}: want {src.get('count', 10)}")
         got, note = build_source(src, cfg, out, exclude, base_url)
         rows += got
