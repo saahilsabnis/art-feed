@@ -30,6 +30,9 @@ jobs:
 
       - run: pip install pillow
 
+      - name: Install ffmpeg (for the 4K video clips)
+        run: command -v ffmpeg || (sudo apt-get update -q && sudo apt-get install -y -q ffmpeg)
+
       - id: pages
         uses: actions/configure-pages@v5
 

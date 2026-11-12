@@ -1,5 +1,7 @@
 {
   "max_size": [3840, 2160],
+  "photo_size": [1920, 1080],
+  "video": {"enabled": true, "seconds": 60, "crf": 16},
   "crop_to_fill": true,
   "min_source_scale": 1.0,
   "jpeg_quality": 92,

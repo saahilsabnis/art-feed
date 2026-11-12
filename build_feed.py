@@ -2,12 +2,15 @@
 """Build this week's art feed for Aerial Views.
 
 Picks random public-domain paintings from museum open-access APIs (the Met and
-the Cleveland Museum of Art), resizes each one to fit a 4K screen, and writes a
-small website: img/ (the paintings), feed.csv (for Aerial Views), feed.m3u
-(for Projectivy's Overflight plugin) and index.html (a gallery to browse).
+the Cleveland Museum of Art), crops each one to exactly 16:9 at 4K, and writes a
+small website:
+  feed-4k.csv  60-second 4K video clips (video/), which Google TV shows at full 4K
+  feed.csv     photos (img/) sized for the TV's 1080p interface layer
+  feed.m3u     the photos, for Projectivy's Overflight plugin
+  index.html   a gallery to browse, plus build-log.txt
 
 The mix of sources lives in sources.json. GitHub Actions runs this weekly.
-Local test:  pip install pillow && python build_feed.py --base-url http://localhost:8000
+Local test:  pip install pillow (and install ffmpeg) && python build_feed.py --base-url http://localhost:8000
 """
 import argparse
 import html
@@ -16,7 +19,10 @@ import json
 import math
 import random
 import re
+import shutil
+import subprocess
 import sys
+import tempfile
 import time
 import urllib.parse
 import urllib.request
@@ -228,9 +234,38 @@ def detail_scale(width, height, out_w, out_h, crop):
     return max(width / out_w, height / out_h)  # fitted inside the screen
 
 
-def save_resized(data, cfg, out_file, thumb_file, lo, hi):
-    """Crop (or fit) the picture to the screen, save it as a high-quality JPEG and
-    make a gallery thumbnail. Returns None if saved, or why it was skipped."""
+def make_video(im, path, size, vcfg):
+    """Turn a still picture into a 4K H.264 clip. Only a frame every 10 seconds is
+    stored (the picture never changes), so it encodes in seconds and stays small."""
+    w, h = size
+    with tempfile.TemporaryDirectory() as tmp:
+        frame = Path(tmp) / "frame.png"
+        im.save(frame, "PNG", compress_level=1)
+        vf = (f"pad={w}:{h}:(ow-iw)/2:(oh-ih)/2," if im.size != (w, h) else "")
+        vf += "scale=out_color_matrix=bt709:out_range=tv,format=yuv420p"
+        cmd = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
+               "-loop", "1", "-framerate", "0.1", "-i", str(frame),
+               "-t", str(vcfg.get("seconds", 60)), "-vf", vf,
+               "-c:v", "libx264", "-preset", "slow", "-tune", "stillimage",
+               "-crf", str(vcfg.get("crf", 16)), "-bf", "0",
+               "-profile:v", "high", "-level", "5.1",
+               "-x264-params", "keyint=infinite:scenecut=0",
+               "-colorspace", "bt709", "-color_primaries", "bt709",
+               "-color_trc", "bt709", "-color_range", "tv",
+               "-an", "-movflags", "+faststart", str(path)]
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=900)
+        if result.returncode:
+            raise RuntimeError(f"ffmpeg failed: {result.stderr.strip()[-300:]}")
+
+
+def remove_outputs(out, key):
+    for sub, ext in (("img", "jpg"), ("thumbs", "jpg"), ("video", "mp4")):
+        (out / sub / f"{key}.{ext}").unlink(missing_ok=True)
+
+
+def save_resized(data, cfg, out, key, lo, hi):
+    """Crop (or fit) the picture to the screen, then write the photo, the 4K video
+    clip and a gallery thumbnail. Returns None if saved, or why it was skipped."""
     out_w, out_h = cfg["max_size"]
     crop = cfg.get("crop_to_fill", True)
     with Image.open(io.BytesIO(data)) as im:
@@ -253,16 +288,22 @@ def save_resized(data, cfg, out_file, thumb_file, lo, hi):
             im = im.crop((left, top, left + cw, top + ch)).resize((out_w, out_h), Image.LANCZOS)
         else:
             im.thumbnail((out_w, out_h), Image.LANCZOS)
+        if cfg["video"].get("enabled"):
+            make_video(im, out / "video" / f"{key}.mp4", (out_w, out_h), cfg["video"])
+        # Aerial Views draws photos at the TV's interface size (1080p on Google TV),
+        # so the photo feed is stored at that size.
+        photo = im.copy()
+        photo.thumbnail(tuple(cfg["photo_size"]), Image.LANCZOS)
         quality = cfg.get("jpeg_quality", 92)
         for q in (quality, quality - 6):
             buf = io.BytesIO()
             # subsampling=0 keeps full colour detail (4:4:4) for fine brushwork
-            im.save(buf, "JPEG", quality=q, subsampling=0, optimize=True, progressive=True)
+            photo.save(buf, "JPEG", quality=q, subsampling=0, optimize=True, progressive=True)
             if buf.tell() <= cfg.get("max_file_mb", 6) * 1e6:
                 break
-        out_file.write_bytes(buf.getvalue())
-        im.thumbnail((480, 480), Image.LANCZOS)
-        im.save(thumb_file, "JPEG", quality=80)
+        (out / "img" / f"{key}.jpg").write_bytes(buf.getvalue())
+        photo.thumbnail((480, 480), Image.LANCZOS)
+        photo.save(out / "thumbs" / f"{key}.jpg", "JPEG", quality=80)
     return None
 
 
@@ -293,16 +334,18 @@ def build_source(src, cfg, out, exclude, base_url):
                 break
             try:
                 data = fetch(c["url"], limit=MAX_DOWNLOAD)
-                why = save_resized(data, cfg, out / "img" / f"{c['key']}.jpg",
-                                   out / "thumbs" / f"{c['key']}.jpg", lo, hi)
+                why = save_resized(data, cfg, out, c["key"], lo, hi)
             except Exception as e:
+                remove_outputs(out, c["key"])
                 log(f"    skipped {c['key']}: {e}")
                 continue
             if why:
                 rejected[why] += 1
                 continue
             exclude.add(c["key"])
+            video = cfg["video"].get("enabled")
             rows.append({"key": c["key"], "url": f"{base_url}/img/{c['key']}.jpg",
+                         "video": f"{base_url}/video/{c['key']}.mp4" if video else None,
                          "description": c["description"], "source": src["name"]})
             log(f"    [{len(rows)}/{want}] {c['description'][:90]}")
             if len(rows) >= want:
@@ -329,6 +372,13 @@ def last_week_keys(base_url):
 def write_site(out, rows, base_url, summary):
     lines = ["url,description"] + [f'{r["url"]},"{r["description"]}"' for r in rows]
     (out / "feed.csv").write_text("\n".join(lines) + "\n", encoding="utf-8")
+    videos = [r for r in rows if r.get("video")]
+    if videos:
+        lines = ["url,description"] + [f'{r["video"]},"{r["description"]}"' for r in videos]
+        (out / "feed-4k.csv").write_text("\n".join(lines) + "\n", encoding="utf-8")
+    feeds = (f'4K video feed: <a href="feed-4k.csv">{html.escape(base_url)}/feed-4k.csv</a> · '
+             if videos else "")
+    feeds += f'photo feed: <a href="feed.csv">{html.escape(base_url)}/feed.csv</a>'
     m3u = ["#EXTM3U"] + [f'#EXTINF:-1,{r["description"]}\n{r["url"]}' for r in rows]
     (out / "feed.m3u").write_text("\n".join(m3u) + "\n", encoding="utf-8")
     cards = "\n".join(
@@ -352,7 +402,7 @@ h1{{font-size:20px;margin:0 0 4px}} p{{margin:0 0 16px;color:#aaa}} a{{color:inh
 ul{{margin:0 0 16px;padding-left:20px;color:#aaa}} p a,ul a{{text-decoration:underline}}
 </style></head><body>
 <h1>This week's paintings</h1>
-<p>{len(rows)} works, built {time.strftime('%Y-%m-%d')}. Aerial Views feed: <a href="feed.csv">{html.escape(base_url)}/feed.csv</a> · <a href="build-log.txt">build log</a></p>
+<p>{len(rows)} works, built {time.strftime('%Y-%m-%d')}. {feeds} · <a href="build-log.txt">build log</a></p>
 <ul>{sources}</ul>
 <div class="grid">
 {cards}
@@ -369,11 +419,16 @@ def main():
 
     cfg = json.loads(Path(a.config).read_text(encoding="utf-8"))
     cfg.setdefault("max_size", [3840, 2160])
+    cfg.setdefault("photo_size", [1920, 1080])
     cfg.setdefault("jpeg_quality", 92)
+    cfg.setdefault("video", {"enabled": True, "seconds": 60, "crf": 16})
+    if cfg["video"].get("enabled") and not shutil.which("ffmpeg"):
+        log("ffmpeg not found: building photos only, no 4K video feed")
+        cfg["video"]["enabled"] = False
     base_url = a.base_url.rstrip("/")
     out = Path(a.out)
-    (out / "img").mkdir(parents=True, exist_ok=True)
-    (out / "thumbs").mkdir(parents=True, exist_ok=True)
+    for sub in ("img", "thumbs", "video"):
+        (out / sub).mkdir(parents=True, exist_ok=True)
 
     exclude = last_week_keys(base_url) if cfg.get("skip_last_week", True) else set()
     log(f"Skipping {len(exclude)} paintings used last week")
@@ -394,9 +449,24 @@ def main():
         log(f"Only {len(rows)} paintings found; not publishing, so last week's set stays up.")
         sys.exit(1)
     random.shuffle(rows)
+    # GitHub Pages sites must stay under 1 GB: drop the largest clips if needed
+    # (those paintings stay in the photo feed).
+    mb = lambda p: p.stat().st_size / 1e6 if p.exists() else 0
+    total = sum(mb(f) for sub in ("img", "thumbs", "video") for f in (out / sub).iterdir())
+    for r in sorted((r for r in rows if r["video"]),
+                    key=lambda r: -mb(out / "video" / f"{r['key']}.mp4")):
+        if total <= cfg.get("max_site_mb", 950):
+            break
+        clip = out / "video" / f"{r['key']}.mp4"
+        total -= mb(clip)
+        clip.unlink()
+        r["video"] = None
+        log(f"  dropped the 4K clip for {r['key']} to stay under GitHub's 1 GB limit")
     write_site(out, rows, base_url, summary)
-    size = sum(f.stat().st_size for f in (out / "img").iterdir()) / 1e6
-    log(f"Done: {len(rows)} paintings, {size:.0f} MB of images")
+    photos = sum(mb(f) for f in (out / "img").iterdir())
+    clips = sum(mb(f) for f in (out / "video").iterdir())
+    log(f"Done: {len(rows)} paintings, {photos:.0f} MB of photos, "
+        f"{sum(1 for r in rows if r['video'])} 4K clips ({clips:.0f} MB)")
     (out / "build-log.txt").write_text("\n".join(LOG_LINES) + "\n", encoding="utf-8")
 
 
