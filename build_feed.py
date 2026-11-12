@@ -25,6 +25,7 @@ from pathlib import Path
 from PIL import Image
 
 MET = "https://collectionapi.metmuseum.org/public/collection/v1"
+MET_SEARCH = "https://collectionapi.metmuseum.org/public/collection/v1.1/search"
 CMA = "https://openaccess-api.clevelandart.org/api/artworks/"
 HEADERS = {"User-Agent": "aerialviews-art-feed/1.0 (+github actions)"}
 MAX_DOWNLOAD = 300 * 1024 * 1024   # Cleveland's full scans are uncompressed TIFFs (~70-130 MB)
@@ -140,13 +141,29 @@ def met_department(src):
     yield from met_candidates(src, ids)
 
 
+def met_search_ids(department, query):
+    """All matching IDs from the Met's paged search (v1.1; v1/search was retired
+    on 2026-10-01). Pages hold up to 500 IDs; the Met stops at 10,000 results."""
+    ids, offset, page = [], 0, 500
+    while offset < 10_000:
+        params = urllib.parse.urlencode({"departmentId": department, "hasImages": "true",
+                                         "q": query, "offset": offset, "limit": page})
+        data = get_json(f"{MET_SEARCH}?{params}")
+        batch = data.get("objectIDs") or []
+        ids += batch
+        offset += page
+        if len(batch) < page or offset >= (data.get("total") or 0):
+            break
+        time.sleep(0.2)
+    return ids
+
+
 def met_search(src):
     ids = []
     for d in src["departments"]:
         for q in src["queries"]:
-            params = urllib.parse.urlencode({"departmentId": d, "hasImages": "true", "q": q})
             try:
-                found = get_json(f"{MET}/search?{params}").get("objectIDs") or []
+                found = met_search_ids(d, q)
             except Exception as e:
                 log(f"  Met search for '{q}' in department {d} failed: {e}")
                 found = []
