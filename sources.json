@@ -45,7 +45,7 @@
     {
       "name": "Cleveland Indian paintings",
       "type": "cma",
-      "department": "Indian and South East Asian Art",
+      "department": "Indian and Southeast Asian Art",
       "culture_terms": ["india", "nepal", "sri lanka", "bhutan", "rajasthan", "rajput", "pahari", "punjab", "kashmir", "bengal", "gujarat", "himachal", "mewar", "kangra"],
       "count": 20,
       "min_ratio": 0.55,
