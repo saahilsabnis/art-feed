@@ -116,6 +116,56 @@ def contains_any(text, terms):
     return any(t.lower() in text for t in terms)
 
 
+CAPTION_MAX = 80
+
+
+def short_title(title):
+    """Drop the series part of long manuscript titles:
+    'Rama ... Sita: Illustrated folio from a dispersed Ramayana series' -> 'Rama ... Sita'."""
+    t = clean(title)
+    head, sep, tail = t.partition(":")
+    if sep and head.strip() and re.search(r"\b(folio|page|leaf|from an?|from the)\b", tail, re.I):
+        return head.strip()
+    return t
+
+
+def short_artist(artist):
+    """'Kano Tan'yū (Japanese, 1602–1674)' -> 'Kano Tan'yū'."""
+    return re.sub(r"\s*\([^()]*\)\s*$", "", clean(artist)).strip()
+
+
+def caption(title, artist, date):
+    """'Title — Artist, Date'. Missing parts are simply left out; never a placeholder."""
+    t, a, d = short_title(title), short_artist(artist), clean(date)
+
+    def build(t):
+        base = f"{t} — {a}" if t and a else (t or a)
+        return f"{base}, {d}" if base and d else (base or d)
+
+    text = build(t)
+    if len(text) > CAPTION_MAX:
+        room = CAPTION_MAX - (len(text) - len(t)) - 1
+        if t and room >= 20:  # shorten the title, keep artist and date whole
+            text = build(t[:room].rstrip(" ,;:—-") + "…")
+        else:
+            text = text[:CAPTION_MAX - 1].rstrip() + "…"
+    return text
+
+
+def series_of(title):
+    """The manuscript or series a single page belongs to, or None:
+    'Text, Folio 52 (verso), from a Kalpa-sutra' -> 'kalpasutra'."""
+    t = clean(title)
+    if not re.search(r"\b(folio|page|leaf|text)\b", t, re.I):
+        return None
+    m = re.search(r"\bfrom (?:an?|the)\s+(.+)$", t, re.I)
+    if not m:
+        return None
+    s = re.sub(r"\([^)]*\)", " ", m.group(1).lower())
+    s = re.sub(r"\b(dispersed|illustrated|manuscript|series|set|album|the|a|an|of)\b", " ", s)
+    return re.sub(r"[^a-z]", "", s) or None
+
+
 # ---------------- candidate generators ----------------
 # Each yields dicts: {"key", "url", "description", "ratio"} (ratio may be None).
 
@@ -162,9 +212,8 @@ def met_candidates(src, ids):
                 "department", "classification", "objectName", "title"))
             if contains_any(about, src["exclude_terms"]):
                 continue
-        parts = (o.get("title"), o.get("artistDisplayName"), o.get("objectDate"))
-        yield {"key": f"met-{oid}", "url": o["primaryImage"],
-               "description": " - ".join(clean(p) for p in parts if p),
+        yield {"key": f"met-{oid}", "url": o["primaryImage"], "title": o.get("title") or "",
+               "description": caption(o.get("title"), o.get("artistDisplayName"), o.get("objectDate")),
                "ratio": met_ratio(o)}
 
 
@@ -247,9 +296,8 @@ def cma(src):
             continue
         creators = a.get("creators") or []
         artist = creators[0].get("description") if creators else None
-        parts = (a.get("title"), artist, a.get("creation_date"))
-        yield {"key": f"cma-{a.get('id')}", "url": img["url"],
-               "description": " - ".join(clean(p) for p in parts if p),
+        yield {"key": f"cma-{a.get('id')}", "url": img["url"], "title": a.get("title") or "",
+               "description": caption(a.get("title"), artist, a.get("creation_date")),
                "ratio": ratio_of(img.get("width"), img.get("height")),
                "pixels": (num(img.get("width")), num(img.get("height"))),
                "bytes": num(img.get("filesize")), "alt": alt}
@@ -355,19 +403,28 @@ def save_resized(source, cfg, out, key, lo, hi, allow_backup=True):
     return tier, s
 
 
-def build_source(src, cfg, out, chosen, last_week, base_url):
+def build_source(src, cfg, out, chosen, last_week, base_url, series_count=None):
     """Pick this source's paintings in order of preference:
     1. new works whose scan fills 4K without upscaling,
     2. if short: new works below 4K but still sharper than 1080p (sharpest first),
-    3. if still short: works shown last week (when repeat_last_week_if_short is on)."""
+    3. if still short: works shown last week (when repeat_last_week_if_short is on).
+    Script-only pages are skipped, and at most max_per_series pages come from any one
+    manuscript (shared across sources through series_count)."""
     want = int(src.get("count", 10))
     lo, hi = float(src.get("min_ratio", 1.15)), float(src.get("max_ratio", 3.0))
     out_w, out_h = cfg["max_size"]
     crop = cfg.get("crop_to_fill", True)
     repeats_ok = cfg.get("repeat_last_week_if_short", True)
+    skip_prefixes = tuple(p.lower() for p in cfg.get("skip_titles_starting_with", ["Text,"]))
+    max_series = int(cfg.get("max_per_series", 2))
+    series_count = series_count if series_count is not None else {}
     rows, backups, later, note = [], [], [], ""
     tries = 0
-    rejected = {"wrong shape": 0, "too low-res": 0, "too large": 0, "not needed": 0}
+    rejected = {"wrong shape": 0, "too low-res": 0, "too large": 0, "not needed": 0,
+                "text page": 0, "series limit": 0}
+
+    def series_full(series):
+        return bool(series) and series_count.get(series, 0) >= max_series
     tmp = tempfile.TemporaryDirectory()
     source_file = Path(tmp.name) / "source"
     video = cfg["video"].get("enabled")
@@ -376,11 +433,14 @@ def build_source(src, cfg, out, chosen, last_week, base_url):
         return {"key": c["key"], "url": f"{base_url}/img/{c['key']}.jpg",
                 "video": f"{base_url}/video/{c['key']}.mp4" if video else None,
                 "description": c["description"], "source": src["name"],
-                "tier": tier, "scale": scale, "repeat": repeat}
+                "tier": tier, "scale": scale, "repeat": repeat,
+                "series": series_of(c.get("title"))}
 
     def take(row):
         rows.append(row)
         chosen.add(row["key"])
+        if row["series"]:
+            series_count[row["series"]] = series_count.get(row["series"], 0) + 1
         extra = []
         if row["tier"] == "backup":
             extra.append(f"below 4K, {row['scale'] * out_w:.0f}px wide crop")
@@ -413,6 +473,12 @@ def build_source(src, cfg, out, chosen, last_week, base_url):
         for c in GENERATORS[src["type"]](src):
             if c["key"] in chosen:
                 continue
+            if (c.get("title") or "").strip().lower().startswith(skip_prefixes):
+                rejected["text page"] += 1  # a page of script, not a picture
+                continue
+            if series_full(series_of(c.get("title"))):
+                rejected["series limit"] += 1
+                continue
             # The catalogue shape is a rough guide (a pair of screens may be photographed
             # together), so only skip clear misses here and check real pixels below.
             if c["ratio"] and not (lo * 0.92 <= c["ratio"] <= hi * 1.5):
@@ -441,7 +507,10 @@ def build_source(src, cfg, out, chosen, last_week, base_url):
                 break
             # Only convert below-4K works while the reserve could still be needed.
             outcome, s = process(c, allow_backup=len(backups) < want - len(rows))
-            if outcome == "too large" and c.get("alt"):
+            if outcome in ("4k", "backup") and series_full(series_of(c.get("title"))):
+                remove_outputs(out, c["key"])  # its manuscript filled up meanwhile
+                rejected["series limit"] += 1
+            elif outcome == "too large" and c.get("alt"):
                 rejected["too large"] += 1
                 alt = use_print_instead(c)
                 ap = alt["pixels"]
@@ -468,6 +537,8 @@ def build_source(src, cfg, out, chosen, last_week, base_url):
             for rank, _, _, kind, item in sorted(queue):
                 if len(rows) >= want:
                     break
+                if series_full(item["series"] if kind == "ready" else series_of(item.get("title"))):
+                    continue
                 if kind == "ready":
                     take(item)
                     continue
@@ -491,7 +562,9 @@ def build_source(src, cfg, out, chosen, last_week, base_url):
     if not note and len(rows) < want:
         note = "ran out of suitable works"
     log(f"  skipped after checking: {rejected['wrong shape']} wrong shape, "
-        f"{rejected['too low-res']} at or below 1080p, {rejected['too large']} TIFFs over 2 GB")
+        f"{rejected['too low-res']} at or below 1080p, {rejected['too large']} TIFFs over 2 GB, "
+        f"{rejected['text page']} script-only pages, {rejected['series limit']} over the "
+        f"{max_series}-per-manuscript limit")
     log(f"  => {src['name']}: {len(rows)} of {want} ({detail}){' (' + note + ')' if note else ''}")
     return rows, (detail + ("; " + note if note else ""))
 
@@ -566,7 +639,7 @@ def main():
         (out / sub).mkdir(parents=True, exist_ok=True)
 
     last_week = last_week_keys(base_url) if cfg.get("skip_last_week", True) else set()
-    chosen = set()
+    chosen, series_count = set(), {}
     log(f"{len(last_week)} paintings from last week are only reused if a source runs short"
         if cfg.get("repeat_last_week_if_short", True) else
         f"Skipping {len(last_week)} paintings used last week")
@@ -576,7 +649,7 @@ def main():
         # Top-level exclude_terms apply to every source.
         src = {**src, "exclude_terms": src.get("exclude_terms", []) + cfg.get("exclude_terms", [])}
         log(f"{src['name']}: want {src.get('count', 10)}")
-        got, note = build_source(src, cfg, out, chosen, last_week, base_url)
+        got, note = build_source(src, cfg, out, chosen, last_week, base_url, series_count)
         rows += got
         summary.append((src["name"], len(got), int(src.get("count", 10)), note))
 

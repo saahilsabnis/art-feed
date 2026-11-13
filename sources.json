@@ -9,6 +9,8 @@
   "max_file_mb": 6,
   "skip_last_week": true,
   "repeat_last_week_if_short": true,
+  "skip_titles_starting_with": ["Text,"],
+  "max_per_series": 2,
   "min_total": 10,
   "exclude_terms": ["islamic", "mughal", "deccan", "sultanate", "golconda", "bijapur", "ottoman"],
   "sources": [
