@@ -34,7 +34,7 @@ MET = "https://collectionapi.metmuseum.org/public/collection/v1"
 MET_SEARCH = "https://collectionapi.metmuseum.org/public/collection/v1.1/search"
 CMA = "https://openaccess-api.clevelandart.org/api/artworks/"
 HEADERS = {"User-Agent": "aerialviews-art-feed/1.0 (+github actions)"}
-MAX_DOWNLOAD = 300 * 1024 * 1024   # Cleveland's full scans are uncompressed TIFFs (~70-130 MB)
+MAX_DOWNLOAD = 2 * 1024 ** 3   # Cleveland's full scans are uncompressed TIFFs; big screens exceed 300 MB
 MAX_TRIES_PER_PICK = 8          # downloads attempted per painting wanted
 MAX_MET_LOOKUPS = 4000          # Met object lookups per source, at most
 Image.MAX_IMAGE_PIXELS = 600_000_000  # museum scans are huge; these sources are trusted
@@ -77,6 +77,34 @@ def fetch(url, tries=3, limit=None):
 
 def get_json(url):
     return json.loads(fetch(url))
+
+
+def safe_url(url):
+    """Some Met image links contain spaces ('.../SF 58.189.1.jpg'); escape them."""
+    return urllib.parse.quote(url, safe=":/?&=%#+,;@~")
+
+
+class TooLarge(Exception):
+    pass
+
+
+def download(url, dest, limit=MAX_DOWNLOAD, tries=3):
+    """Stream a (possibly huge) image to disk instead of holding it in memory."""
+    for attempt in range(tries):
+        try:
+            req = urllib.request.Request(safe_url(url), headers=HEADERS)
+            with urllib.request.urlopen(req, timeout=120) as r, open(dest, "wb") as f:
+                size = 0
+                while chunk := r.read(1 << 20):
+                    size += len(chunk)
+                    if size > limit:
+                        raise TooLarge()
+                    f.write(chunk)
+            return
+        except Exception as e:
+            if attempt == tries - 1 or isinstance(e, TooLarge):
+                raise
+            time.sleep(2 * (attempt + 1))
 
 
 def clean(text):
@@ -204,6 +232,10 @@ def cma(src):
         img = imgs.get(size) or imgs.get("print") or {}
         if not img.get("url"):
             continue
+        prt = imgs.get("print") or {}
+        # The 3400px print JPEG is a light stand-in when the TIFF is too big or not needed.
+        alt = ({"url": prt["url"], "pixels": (num(prt.get("width")), num(prt.get("height")))}
+               if prt.get("url") and prt.get("url") != img["url"] else None)
         if src.get("culture_terms") and not contains_any(" ".join(a.get("culture") or []), src["culture_terms"]):
             continue
         if src.get("text_terms") and not contains_any(
@@ -219,7 +251,8 @@ def cma(src):
         yield {"key": f"cma-{a.get('id')}", "url": img["url"],
                "description": " - ".join(clean(p) for p in parts if p),
                "ratio": ratio_of(img.get("width"), img.get("height")),
-               "pixels": (num(img.get("width")), num(img.get("height")))}
+               "pixels": (num(img.get("width")), num(img.get("height"))),
+               "bytes": num(img.get("filesize")), "alt": alt}
 
 
 GENERATORS = {"met-department": met_department, "met-search": met_search, "cma": cma}
@@ -263,21 +296,36 @@ def remove_outputs(out, key):
         (out / sub / f"{key}.{ext}").unlink(missing_ok=True)
 
 
-def save_resized(data, cfg, out, key, lo, hi):
+def quality_tier(scale, cfg):
+    """'4k' if the scan fills the screen without upscaling, 'backup' if it is still
+    sharper than 1080p, else None."""
+    if scale >= cfg.get("min_source_scale", 1.0):
+        return "4k"
+    if scale > cfg.get("fallback_min_scale", 0.5):  # 0.5 of 3840 px = 1080p: strictly above
+        return "backup"
+    return None
+
+
+def save_resized(source, cfg, out, key, lo, hi, allow_backup=True):
     """Crop (or fit) the picture to the screen, then write the photo, the 4K video
-    clip and a gallery thumbnail. Returns None if saved, or why it was skipped."""
+    clip and a gallery thumbnail. Returns (outcome, scale): outcome is '4k' or
+    'backup' if saved, otherwise why it was skipped."""
     out_w, out_h = cfg["max_size"]
     crop = cfg.get("crop_to_fill", True)
-    with Image.open(io.BytesIO(data)) as im:
+    with Image.open(source) as im:
         w, h = im.size
         if not (lo <= w / h <= hi):
-            return "wrong shape"
+            return "wrong shape", None
         s = detail_scale(w, h, out_w, out_h, crop)
-        if s < cfg.get("min_source_scale", 1.0):
-            return "too low-res"
+        tier = quality_tier(s, cfg)
+        if tier is None:
+            return "too low-res", s
+        if tier == "backup" and not allow_backup:
+            return "not needed", s
         # Decode big JPEGs at a reduced size, but never below what the screen needs.
         im.draft("RGB", (math.ceil(w / s), math.ceil(h / s)))
-        im = im.convert("RGB")
+        if im.mode != "RGB":  # (converting an RGB image would just copy it; huge scans add up)
+            im = im.convert("RGB")
         if crop:  # centre-crop to exactly the screen's shape, then scale to 4K
             target = out_w / out_h
             if im.width / im.height > target:
@@ -304,61 +352,148 @@ def save_resized(data, cfg, out, key, lo, hi):
         (out / "img" / f"{key}.jpg").write_bytes(buf.getvalue())
         photo.thumbnail((480, 480), Image.LANCZOS)
         photo.save(out / "thumbs" / f"{key}.jpg", "JPEG", quality=80)
-    return None
+    return tier, s
 
 
-def build_source(src, cfg, out, exclude, base_url):
+def build_source(src, cfg, out, chosen, last_week, base_url):
+    """Pick this source's paintings in order of preference:
+    1. new works whose scan fills 4K without upscaling,
+    2. if short: new works below 4K but still sharper than 1080p (sharpest first),
+    3. if still short: works shown last week (when repeat_last_week_if_short is on)."""
     want = int(src.get("count", 10))
     lo, hi = float(src.get("min_ratio", 1.15)), float(src.get("max_ratio", 3.0))
     out_w, out_h = cfg["max_size"]
-    crop, min_scale = cfg.get("crop_to_fill", True), cfg.get("min_source_scale", 1.0)
-    rows, tries, note = [], 0, ""
-    rejected = {"wrong shape": 0, "too low-res": 0}
+    crop = cfg.get("crop_to_fill", True)
+    repeats_ok = cfg.get("repeat_last_week_if_short", True)
+    rows, backups, later, note = [], [], [], ""
+    tries = 0
+    rejected = {"wrong shape": 0, "too low-res": 0, "too large": 0, "not needed": 0}
+    tmp = tempfile.TemporaryDirectory()
+    source_file = Path(tmp.name) / "source"
+    video = cfg["video"].get("enabled")
+
+    def make_row(c, tier, scale, repeat):
+        return {"key": c["key"], "url": f"{base_url}/img/{c['key']}.jpg",
+                "video": f"{base_url}/video/{c['key']}.mp4" if video else None,
+                "description": c["description"], "source": src["name"],
+                "tier": tier, "scale": scale, "repeat": repeat}
+
+    def take(row):
+        rows.append(row)
+        chosen.add(row["key"])
+        extra = []
+        if row["tier"] == "backup":
+            extra.append(f"below 4K, {row['scale'] * out_w:.0f}px wide crop")
+        if row["repeat"]:
+            extra.append("from last week")
+        log(f"    [{len(rows)}/{want}] {row['description'][:90]}"
+            + (f" ({', '.join(extra)})" if extra else ""))
+
+    def process(c, allow_backup):
+        """Download and convert one work. Returns (outcome, scale)."""
+        nonlocal tries
+        tries += 1
+        try:
+            download(c["url"], source_file)
+            return save_resized(source_file, cfg, out, c["key"], lo, hi, allow_backup)
+        except TooLarge:
+            return "too large", None
+        except Exception as e:
+            remove_outputs(out, c["key"])
+            log(f"    skipped {c['key']}: {e}")
+            return "error", None
+        finally:
+            source_file.unlink(missing_ok=True)
+
+    def use_print_instead(c):
+        alt = c.get("alt")
+        return {**c, "url": alt["url"], "pixels": alt["pixels"], "bytes": None, "alt": None}
+
     try:
         for c in GENERATORS[src["type"]](src):
-            if c["key"] in exclude:
+            if c["key"] in chosen:
                 continue
             # The catalogue shape is a rough guide (a pair of screens may be photographed
             # together), so only skip clear misses here and check real pixels below.
             if c["ratio"] and not (lo * 0.92 <= c["ratio"] <= hi * 1.5):
                 continue
+            if c.get("bytes") and c["bytes"] > MAX_DOWNLOAD and c.get("alt"):
+                rejected["too large"] += 1
+                c = use_print_instead(c)
+            repeat = c["key"] in last_week
             pw, ph = c.get("pixels") or (None, None)
-            if pw and ph:  # pixel size known up front (Cleveland): skip without downloading
+            s = None
+            if pw and ph:  # pixel size known up front (Cleveland): decide without downloading
                 if not (lo <= pw / ph <= hi):
                     continue
-                if detail_scale(pw, ph, out_w, out_h, crop) < min_scale:
+                s = detail_scale(pw, ph, out_w, out_h, crop)
+                tier = quality_tier(s, cfg)
+                if tier is None:
                     rejected["too low-res"] += 1
                     continue
-            tries += 1
-            if tries > want * MAX_TRIES_PER_PICK:
-                break
-            try:
-                data = fetch(c["url"], limit=MAX_DOWNLOAD)
-                why = save_resized(data, cfg, out, c["key"], lo, hi)
-            except Exception as e:
-                remove_outputs(out, c["key"])
-                log(f"    skipped {c['key']}: {e}")
+                if tier == "backup":
+                    later.append((1 if not repeat else 2, -s, c))
+                    continue
+            if repeat:
+                later.append((2, -(s or 0), c))
                 continue
-            if why:
-                rejected[why] += 1
-                continue
-            exclude.add(c["key"])
-            video = cfg["video"].get("enabled")
-            rows.append({"key": c["key"], "url": f"{base_url}/img/{c['key']}.jpg",
-                         "video": f"{base_url}/video/{c['key']}.mp4" if video else None,
-                         "description": c["description"], "source": src["name"]})
-            log(f"    [{len(rows)}/{want}] {c['description'][:90]}")
-            if len(rows) >= want:
+            if tries >= want * MAX_TRIES_PER_PICK:
                 break
-    except Exception as e:  # the API is down or changed: keep going with other sources
+            # Only convert below-4K works while the reserve could still be needed.
+            outcome, s = process(c, allow_backup=len(backups) < want - len(rows))
+            if outcome == "too large" and c.get("alt"):
+                rejected["too large"] += 1
+                alt = use_print_instead(c)
+                ap = alt["pixels"]
+                if ap[0] and ap[1]:
+                    later.append((1, -detail_scale(ap[0], ap[1], out_w, out_h, crop), alt))
+            elif outcome == "4k":
+                take(make_row(c, "4k", s, False))
+                if len(rows) >= want:
+                    break
+            elif outcome == "backup":  # already converted; keep in reserve
+                backups.append(make_row(c, "backup", s, False))
+            elif outcome in rejected:
+                rejected[outcome] += 1
+    except Exception as e:  # the API is down or changed: keep going with what we have
         note = f"stopped early: {type(e).__name__}: {e}"
         log(f"  {src['name']} {note}")
+
+    try:
+        if len(rows) < want:  # top up: sharpest below-4K works first, then last week's
+            queue = [(1, -r["scale"], i, "ready", r) for i, r in enumerate(backups)]
+            queue += [(rank, neg, len(queue) + i, "todo", c) for i, (rank, neg, c) in enumerate(later)
+                      if rank == 1 or repeats_ok]
+            extra_tries = 0
+            for rank, _, _, kind, item in sorted(queue):
+                if len(rows) >= want:
+                    break
+                if kind == "ready":
+                    take(item)
+                    continue
+                if item["key"] in chosen or extra_tries >= want * MAX_TRIES_PER_PICK:
+                    continue
+                extra_tries += 1
+                outcome, s = process(item, allow_backup=True)
+                if outcome in ("4k", "backup"):
+                    take(make_row(item, outcome, s, rank == 2))
+                elif outcome in rejected:
+                    rejected[outcome] += 1
+    finally:
+        for r in backups:  # converted reserves that weren't needed
+            if r["key"] not in chosen:
+                remove_outputs(out, r["key"])
+        tmp.cleanup()
+
+    n4k = sum(r["tier"] == "4k" for r in rows)
+    nrep = sum(r["repeat"] for r in rows)
+    detail = f"{n4k} at 4K, {len(rows) - n4k} below 4K" + (f", {nrep} from last week" if nrep else "")
     if not note and len(rows) < want:
         note = "ran out of suitable works"
     log(f"  skipped after checking: {rejected['wrong shape']} wrong shape, "
-        f"{rejected['too low-res']} too low-res")
-    log(f"  => {src['name']}: {len(rows)} of {want}{' (' + note + ')' if note else ''}")
-    return rows, note
+        f"{rejected['too low-res']} at or below 1080p, {rejected['too large']} TIFFs over 2 GB")
+    log(f"  => {src['name']}: {len(rows)} of {want} ({detail}){' (' + note + ')' if note else ''}")
+    return rows, (detail + ("; " + note if note else ""))
 
 
 def last_week_keys(base_url):
@@ -430,15 +565,18 @@ def main():
     for sub in ("img", "thumbs", "video"):
         (out / sub).mkdir(parents=True, exist_ok=True)
 
-    exclude = last_week_keys(base_url) if cfg.get("skip_last_week", True) else set()
-    log(f"Skipping {len(exclude)} paintings used last week")
+    last_week = last_week_keys(base_url) if cfg.get("skip_last_week", True) else set()
+    chosen = set()
+    log(f"{len(last_week)} paintings from last week are only reused if a source runs short"
+        if cfg.get("repeat_last_week_if_short", True) else
+        f"Skipping {len(last_week)} paintings used last week")
 
     rows, summary = [], []
     for src in cfg["sources"]:
         # Top-level exclude_terms apply to every source.
         src = {**src, "exclude_terms": src.get("exclude_terms", []) + cfg.get("exclude_terms", [])}
         log(f"{src['name']}: want {src.get('count', 10)}")
-        got, note = build_source(src, cfg, out, exclude, base_url)
+        got, note = build_source(src, cfg, out, chosen, last_week, base_url)
         rows += got
         summary.append((src["name"], len(got), int(src.get("count", 10)), note))
 
